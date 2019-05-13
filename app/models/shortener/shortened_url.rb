@@ -1,148 +1,96 @@
 class Shortener::ShortenedUrl < ActiveRecord::Base
 
+  URL_PROTOCOL_HTTP = "http://"
   REGEX_LINK_HAS_PROTOCOL = Regexp.new('\Ahttp:\/\/|\Ahttps:\/\/', Regexp::IGNORECASE)
 
-  validates :url, presence: true
-
-  around_create :generate_unique_key
+  validates :url, :presence => true
 
   # allows the shortened link to be associated with a user
-  if ActiveRecord::VERSION::MAJOR >= 5
-    # adds rails 5 compatibility to have nil values as owner
-    belongs_to :owner, polymorphic: true, optional: true
-  else
-    belongs_to :owner, polymorphic: true
-  end
-
-  # exclude records in which expiration time is set and expiration time is greater than current time
-  scope :unexpired, -> { where(arel_table[:expires_at].eq(nil).or(arel_table[:expires_at].gt(::Time.current.to_s(:db)))) }
-
-  attr_accessor :custom_key
+  belongs_to :owner, :polymorphic => true
 
   # ensure the url starts with it protocol and is normalized
   def self.clean_url(url)
-
-    url = url.to_s.strip
-    if url !~ REGEX_LINK_HAS_PROTOCOL && url[0] != '/'
-      url = "/#{url}"
-    end
+    return nil if url.blank?
+    url = URL_PROTOCOL_HTTP + url.strip unless url =~ REGEX_LINK_HAS_PROTOCOL
     URI.parse(url).normalize.to_s
   end
 
   # generate a shortened link from a url
   # link to a user if one specified
   # throw an exception if anything goes wrong
-  def self.generate!(destination_url, owner: nil, custom_key: nil, expires_at: nil, fresh: false, category: nil)
+  def self.generate!(orig_url, owner=nil)
     # if we get a shortened_url object with a different owner, generate
     # new one for the new owner. Otherwise return same object
-    if destination_url.is_a? Shortener::ShortenedUrl
-      if destination_url.owner == owner
-        destination_url
-      else
-        generate!(
-          destination_url.url,
-          owner:      owner,
-          custom_key: custom_key,
-          expires_at: expires_at,
-          fresh:      fresh,
-          category:   category
-        )
-      end
-    else
-      scope = owner ? owner.shortened_urls : self
-      creation_method = fresh ? 'create' : 'first_or_create'
-
-      scope.where(url: clean_url(destination_url), category: category).send(
-        creation_method,
-        custom_key: custom_key,
-        expires_at: expires_at
-      )
+    if orig_url.is_a?(Shortener::ShortenedUrl)
+      return orig_url.owner == owner ? orig_url : generate!(orig_url.url, owner)
     end
+
+    # don't want to generate the link if it has already been generated
+    # so check the datastore
+    cleaned_url = clean_url(orig_url)
+    scope = owner ? owner.shortened_urls : self
+
+    url_hash = ::Shortener::ShortenedUrl.hash_url(cleaned_url)
+
+    short_link = scope.where(url_hash: url_hash).first
+    short_link = scope.create(url: cleaned_url) if short_link.nil?
+    short_link
   end
 
   # return shortened url on success, nil on failure
-  def self.generate(destination_url, owner: nil, custom_key: nil, expires_at: nil, fresh: false, category: nil)
+  def self.generate(orig_url, owner=nil)
     begin
-      generate!(
-        destination_url,
-        owner: owner,
-        custom_key: custom_key,
-        expires_at: expires_at,
-        fresh: fresh,
-        category: category
-      )
-    rescue => e
-      logger.info e
+      generate!(orig_url, owner)
+    rescue
       nil
     end
   end
 
-  def self.extract_token(token_str)
-    # only use the leading valid characters
-    # escape to ensure custom charsets with protected chars do not fail
-    /^([#{Regexp.escape(Shortener.key_chars.join)}]*).*/.match(token_str)[1]
-  end
-
-  def self.fetch_with_token(token: nil, additional_params: {}, track: true)
-    shortened_url = ::Shortener::ShortenedUrl.unexpired.where(unique_key: token).first
-
-    url = if shortened_url
-      shortened_url.increment_usage_count if track
-      merge_params_to_url(url: shortened_url.url, params: additional_params)
-    else
-      Shortener.default_redirect || '/'
-    end
-
-    { url: url, shortened_url: shortened_url }
-  end
-
-  def self.merge_params_to_url(url: nil, params: {})
-    if params.respond_to?(:permit!)
-      params = params.permit!.to_h.with_indifferent_access.except!(:id, :action, :controller)
-    end
-
-    if Shortener.subdomain
-      params.try(:except!, :subdomain) if params[:subdomain] == Shortener.subdomain
-    end
-
-    if params.present?
-      uri = URI.parse(url)
-      existing_params = Rack::Utils.parse_nested_query(uri.query)
-      uri.query       = existing_params.with_indifferent_access.merge(params).to_query
-      url = uri.to_s
-    end
-
-    url
-  end
-
-  def increment_usage_count
-    self.class.increment_counter(:use_count, id)
-  end
-
-  def to_param
-    unique_key
+  def self.hash_url(string)
+    Digest::SHA1.hexdigest string
   end
 
   private
 
-  def self.unique_key_candidate
+  # the create method changed in rails 4...
+  CREATE_METHOD_NAME =
+      if Rails::VERSION::MAJOR >= 4
+        # And again in 4.0.6/4.1.2
+        if ((Rails::VERSION::MINOR == 0) && (Rails::VERSION::TINY < 6)) ||
+            ((Rails::VERSION::MINOR == 1) && (Rails::VERSION::TINY < 2))
+          "create_record"
+        else
+          "_create_record"
+        end
+      else
+        "create"
+      end
+
+  # we'll rely on the DB to make sure the unique key is really unique.
+  # if it isn't unique, the unique index will catch this and raise an error
+  define_method CREATE_METHOD_NAME do
+    count = 0
+    begin
+      self.unique_key = generate_unique_key
+      self.url_hash = ::Shortener::ShortenedUrl.hash_url(self.url)
+      super()
+    rescue ActiveRecord::RecordNotUnique, ActiveRecord::StatementInvalid => err
+      if (count +=1) < 5
+        logger.info("retrying with different unique key")
+        retry
+      else
+        logger.info("too many retries, giving up")
+        raise
+      end
+    end
+  end
+
+  # generate a random string
+  # future mod to allow specifying a more expansive charst, like utf-8 chinese
+  def generate_unique_key
+    # not doing uppercase as url is case insensitive
     charset = ::Shortener.key_chars
     (0...::Shortener.unique_key_length).map{ charset[rand(charset.size)] }.join
   end
 
-  def generate_unique_key(retries = Shortener.persist_retries)
-    begin
-      self.unique_key = custom_key || self.class.unique_key_candidate
-      self.custom_key = nil
-    end while self.class.unscoped.exists?(unique_key: unique_key)
-
-    yield
-  rescue ActiveRecord::RecordNotUnique
-    if retries <= 0
-      raise
-    else
-      retries -= 1
-      retry
-    end
-  end
 end
