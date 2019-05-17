@@ -19,8 +19,9 @@ module Shortener
   self.unique_key_length = 5
 
   # character set to chose from:
-  #  :alphanum     - a-z0-9     -  has about 60 million possible combos
-  #  :alphanumcase - a-zA-Z0-9  -  has about 900 million possible combos
+  #  :alphanum     // a-z0-9                                       ## has about 60 million possible combos
+  #  :alphanumcase // a-zA-Z0-9                                    ## has about 900 million possible combos
+  #  ("a".."z").to_a + ("A".."Z").to_a + (0..9).to_a + ["-", "_"]  ## define a custom set
   mattr_accessor :charset
   self.charset = :alphanum
 
@@ -36,9 +37,12 @@ module Shortener
   mattr_accessor :ignore_robots
   self.ignore_robots = false
 
+  # persist_retries - number of retries on ActiveRecord::RecordNotUnique error
+  mattr_accessor :persist_retries
+  self.persist_retries = 3
 
   def self.key_chars
-    CHARSETS[charset]
+    charset.is_a?(Symbol) ? CHARSETS[charset] : charset
   end
 end
 
